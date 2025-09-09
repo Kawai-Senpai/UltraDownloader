@@ -1,0 +1,2 @@
+https://speed.hetzner.de/100MB.bin
+https://speed.hetzner.de/10MB.bin
