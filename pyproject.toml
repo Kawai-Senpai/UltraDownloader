@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultradownloader"
+version = "0.2.0"
+description = "Resumable HTTP and YouTube media downloader"
+requires-python = ">=3.12"
+dependencies = [
+  "aiohttp>=3.10,<4",
+  "yt-dlp[default]>=2026.10.21",
+  "pysubs2>=1.9,<2",
+  "imageio-ffmpeg>=0.6,<1",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.51,<2"]
+dev = ["pytest>=8", "ruff>=0.12"]
+
+[project.scripts]
+ultradownloader = "ultradownloader.cli:entrypoint"
+
+[tool.setuptools]
+packages = ["ultradownloader"]
+py-modules = ["get"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

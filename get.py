@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+if __name__ == "__main__":
+    # Bootstrap/setup must work before optional HTTP dependencies are installed.
+    from ultradownloader.cli import entrypoint
+    raise SystemExit(entrypoint())
+
 import argparse
 import asyncio
 import aiohttp
@@ -46,7 +51,10 @@ def fmt_bytes(n: int) -> str:
 def default_name_from_url(url: str) -> str:
     path = urlparse(url).path
     name = os.path.basename(path) or "download.bin"
-    return unquote(name)
+    # Decode before stripping separators: %2F and %5C must never create directories.
+    name = unquote(name).replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(". ")
+    return name or "download.bin"
 
 def now() -> float:
     return time.time()
@@ -61,14 +69,17 @@ def load_meta(out_path: str):
     if os.path.exists(p):
         try:
             with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
+                value = json.load(f)
+                return value if isinstance(value, dict) else None
         except Exception:
             return None
     return None
 
 def save_meta(out_path: str, meta: dict):
-    with open(meta_path(out_path), "w", encoding="utf-8") as f:
+    temporary = meta_path(out_path) + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
         json.dump(meta, f)
+    os.replace(temporary, meta_path(out_path))
 
 # ------------- HTTP capability checks
 
@@ -125,22 +136,15 @@ async def fetch_range(session, url, start, end, out_path, prog, timeout, max_ret
 
         try:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout*2, sock_read=timeout)) as r:
-                if r.status not in (200, 206, 416):
-                    r.raise_for_status()
-
-                if r.status == 416:
-                    # Range already satisfied on server side - treat as done
-                    break
-
-                # If we got 206, sanity check Content-Range so we do not write the wrong bytes
-                if r.status == 206:
-                    cr = r.headers.get("Content-Range", "")
-                    m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", cr)
-                    if m:
-                        srv_start = int(m.group(1))
-                        if srv_start > pos:
-                            # server jumped forward - accept and move our pointer
-                            pos = srv_start
+                if r.status != 206:
+                    if r.status not in (200, 416):
+                        r.raise_for_status()
+                    raise RuntimeError(f"Range {idx}: expected HTTP 206, received {r.status}; resource may have changed")
+                cr = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", r.headers.get("Content-Range", ""))
+                if (not cr or int(cr[1]) != pos or int(cr[2]) != end
+                        or int(cr[3]) != prog.total):
+                    raise RuntimeError(f"Range {idx}: invalid Content-Range")
+                before = pos
 
                 with open(out_path, "r+b") as f:
                     async for chunk in r.content.iter_chunked(1 << 15):
@@ -155,11 +159,12 @@ async def fetch_range(session, url, start, end, out_path, prog, timeout, max_ret
                         await prog.add(want)
                         prog.maybe_print()
 
-                # if we reached EOF before finishing this slice, loop again and ask for the remainder
+                if pos == before:
+                    raise aiohttp.ClientPayloadError("Range response made no progress")
                 attempt = 0  # successful transfer - reset attempt counter
                 backoff = 1.0
 
-        except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as e:
+        except (asyncio.TimeoutError, aiohttp.ClientError):
             print(f"\nChunk {idx} timeout, retrying... (attempt {attempt + 1})")
             attempt += 1
             if attempt > max_retries:
@@ -184,20 +189,31 @@ async def download_segmented(url, out_path, size, chunk_size, concurrency, timeo
     # Check for resume meta
     meta = load_meta(out_path)
     done_idx = set()
-    if meta and meta.get("size") == size and meta.get("url") == url:
-        # Trust resume if validators match
-        if meta.get("etag") == validators.get("etag") or meta.get("last_modified") == validators.get("last_modified"):
-            done_idx = set(meta.get("done", []))
+    etag = validators.get("etag")
+    modified = validators.get("last_modified")
+    same_resource = bool(meta) and (
+        (bool(etag) and not etag.startswith("W/") and meta.get("etag") == etag)
+        or (not etag and bool(modified) and meta.get("last_modified") == modified)
+    )
+    if (same_resource and meta.get("size") == size and meta.get("url") == url
+            and meta.get("chunk_size") == chunk_size and os.path.isfile(out_path)
+            and os.path.getsize(out_path) == size):
+        done_idx = {i for i in meta.get("done", []) if type(i) is int and 0 <= i < len(ranges)}
+
+    # Reset stale metadata before workers start, so old done indices cannot leak back in.
+    save_meta(out_path, {"url": url, "size": size, "chunk_size": chunk_size,
+                         "etag": etag, "last_modified": modified, "done": sorted(done_idx)})
 
     # Preallocate file
-    if not os.path.exists(out_path):
+    if not done_idx:
         with open(out_path, "wb") as f:
             f.truncate(size)
 
     connector = aiohttp.TCPConnector(limit=concurrency, ssl=None)
     timeout_obj = aiohttp.ClientTimeout(total=timeout*3, connect=timeout, sock_read=timeout)
-    headers = {"User-Agent": "fastget/1.0"}
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj, headers=headers) as session:
+    headers = {"User-Agent": "UltraDownloader/0.2", "Accept-Encoding": "identity"}
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj, headers=headers,
+                                     auto_decompress=False) as session:
         prog = Progress(total=size)
         # If resuming, compute already downloaded bytes
         if done_idx:
@@ -208,7 +224,7 @@ async def download_segmented(url, out_path, size, chunk_size, concurrency, timeo
             await prog.add(already)
 
         # Prepare validators for If-Range
-        if_range = validators.get("etag") or validators.get("last_modified") or ""
+        if_range = (etag if etag and not etag.startswith("W/") else modified) or ""
         verify_headers = {"If-Range": if_range} if if_range else {}
 
         sem = asyncio.Semaphore(concurrency)
@@ -241,7 +257,13 @@ async def download_segmented(url, out_path, size, chunk_size, concurrency, timeo
             tasks.append(asyncio.create_task(worker(i, s, e)))
 
         # Wait for all slices - if any failed or was short, this will raise
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     # Clean up meta if complete
     meta = load_meta(out_path)
@@ -260,8 +282,9 @@ async def download_single(url, out_path, timeout, max_retries):
         try:
             connector = aiohttp.TCPConnector(limit=4, ssl=None)
             timeout_obj = aiohttp.ClientTimeout(total=timeout*3, connect=timeout, sock_read=timeout)
-            headers = {"User-Agent": "fastget/1.0"}
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj, headers=headers) as session:
+            headers = {"User-Agent": "UltraDownloader/0.2", "Accept-Encoding": "identity"}
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj, headers=headers,
+                                             auto_decompress=False) as session:
                 async with session.get(url) as r:
                     r.raise_for_status()
                     size = int(r.headers.get("Content-Length") or 0)
@@ -281,7 +304,7 @@ async def download_single(url, out_path, timeout, max_retries):
 
 # ------------- main
 
-async def main():
+async def main(argv=None):
     ap = argparse.ArgumentParser(description="Fast multi connection HTTP downloader with resume")
     ap.add_argument("urls", nargs="+", help="Download URLs (one or more)")
     ap.add_argument("-o", "--output", help="Output file path (for single URL) or directory (for multiple URLs)")
@@ -291,10 +314,14 @@ async def main():
     ap.add_argument("-r", "--retries", type=int, default=5, help="Max retries per chunk")
     ap.add_argument("--hash", dest="expect_hash", help="Optional sha256 to verify after download (single URL only)")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     urls = args.urls
     chunk_size = human_to_bytes(str(args.chunk_size))
+    if chunk_size <= 0 or args.connections <= 0 or args.timeout <= 0 or args.retries < 0:
+        ap.error("Chunk size, connections and timeout must be positive; retries cannot be negative")
+    if args.expect_hash and len(urls) != 1:
+        ap.error("--hash requires a single URL")
 
     # Handle multiple URLs
     if len(urls) > 1:
@@ -304,6 +331,9 @@ async def main():
         
         output_dir = args.output or "."
         os.makedirs(output_dir, exist_ok=True)
+        names = [default_name_from_url(url) for url in urls]
+        if len(set(os.path.normcase(name) for name in names)) != len(names):
+            ap.error("Multiple URLs have the same filename; download them separately with explicit outputs")
         
         # Download all URLs in parallel with error isolation
         async def download_with_error_handling(url, out_path):
@@ -323,11 +353,16 @@ async def main():
         results = await asyncio.gather(*tasks, return_exceptions=True)
         successes = sum(1 for r in results if r is True)
         print(f"\nCompleted {successes}/{len(urls)} downloads in: {output_dir}")
+        if successes != len(urls):
+            raise RuntimeError("One or more HTTP downloads failed")
         return
 
     # Single URL handling (original behavior)
     url = urls[0]
     out_path = args.output or default_name_from_url(url)
+    if os.path.isdir(out_path) or out_path.endswith(("/", "\\")):
+        out_path = os.path.join(out_path, default_name_from_url(url))
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     
     await download_url(url, out_path, chunk_size, args.connections, args.timeout, args.retries)
     print("\nDownload complete:", out_path)
@@ -345,13 +380,15 @@ async def main():
             print("Hash mismatch")
             print("Expected:", args.expect_hash)
             print("Got     :", got)
+            raise RuntimeError("SHA256 verification failed")
 
 async def download_url(url, out_path, chunk_size, connections, timeout, retries):
     # Probe headers
     connector = aiohttp.TCPConnector(limit=4, ssl=None)
     timeout_obj = aiohttp.ClientTimeout(total=timeout*2, connect=timeout)
-    headers = {"User-Agent": "fastget/1.0"}
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj, headers=headers) as session:
+    headers = {"User-Agent": "UltraDownloader/0.2", "Accept-Encoding": "identity"}
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj, headers=headers,
+                                     auto_decompress=False) as session:
         # Use GET 0-0 probe if HEAD is blocked
         size = None
         etag = None
@@ -387,10 +424,3 @@ async def download_url(url, out_path, chunk_size, connections, timeout, retries)
     else:
         print("Server does not support ranges or size is small - using single stream")
         await download_single(url, out_path, timeout, retries)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nStopped by user")
-        sys.exit(1)
